@@ -147,10 +147,10 @@ python -m unittest discover -s tests -v
 
 Default tests use mocked launchers and never open a real console window. The real Windows GUI handshake (`test_windows_viewer_console_handshake`) is opt-in:
 
-```bash
+```powershell
 # Windows only; opens a CREATE_NEW_CONSOLE viewer window
-set CURSOR_HANDOFF_TEST_GUI=1
-python -m unittest tests.test_handoff.VisibleExecutionTests.test_windows_viewer_console_handshake -v
+$env:CURSOR_HANDOFF_TEST_GUI = '1'
+python -m unittest discover -s tests -p test_handoff.py -k test_windows_viewer_console_handshake -v
 ```
 
 ## Package a release

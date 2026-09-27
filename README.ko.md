@@ -147,10 +147,10 @@ python -m unittest discover -s tests -v
 
 기본 테스트는 mock 런처를 쓰며 실제 콘솔 창을 열지 않습니다. 실제 Windows GUI 핸드셰이크(`test_windows_viewer_console_handshake`)는 옵트인입니다:
 
-```bash
+```powershell
 # Windows 전용; CREATE_NEW_CONSOLE 뷰어 창을 엽니다
-set CURSOR_HANDOFF_TEST_GUI=1
-python -m unittest tests.test_handoff.VisibleExecutionTests.test_windows_viewer_console_handshake -v
+$env:CURSOR_HANDOFF_TEST_GUI = '1'
+python -m unittest discover -s tests -p test_handoff.py -k test_windows_viewer_console_handshake -v
 ```
 
 ## 릴리스 패키징

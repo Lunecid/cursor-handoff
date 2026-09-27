@@ -751,9 +751,14 @@ class VisibleExecutionTests(unittest.TestCase):
             task = self.write_task()
             proc = self.run_handoff(task, extra=["--open-terminal"])
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            status = json.loads(
-                (self.latest_run() / "status.json").read_text(encoding="utf-8")
-            )
+            # fake-run sorts after dated run ids; use runner stdout JSON for the real path.
+            lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+            self.assertTrue(lines, proc.stdout)
+            final = json.loads(lines[-1])
+            run_path = Path(final["run"])
+            self.assertTrue(run_path.is_dir(), final)
+            self.assertNotEqual(run_path.name, "fake-run")
+            status = json.loads((run_path / "status.json").read_text(encoding="utf-8"))
             self.assertIn("viewer", status)
             self.assertIn("manual_command", status["viewer"])
             # open-terminal enables live on non-Windows

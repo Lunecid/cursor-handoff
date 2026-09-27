@@ -1,0 +1,7 @@
+.cursor-handoff/
+.handoff-dev/
+dist/
+__pycache__/
+*.pyc
+.env
+.env.*

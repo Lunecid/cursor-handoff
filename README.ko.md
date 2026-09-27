@@ -94,6 +94,8 @@ python skills/cursor-handoff/scripts/consult.py \
 2. 대상 워크스페이스 안에 UTF-8 작업 파일을 작성합니다(`examples/task.md` 참고).
 3. 실행:
 
+Codex·Claude Code 토큰을 아끼려면 코드 탐색과 검증은 Cursor에 맡기고, 설계자는 작업 범위에 필요한 규칙·맥락만 읽은 뒤 Cursor의 간결한 결과와 관련 변경 diff를 검토합니다. 오류나 위험이 있을 때만 전체 로그를 펼칩니다. Claude 논의는 요청 시에만 수행하며 Claude 토큰을 사용합니다. 총 토큰 또는 비용 절감은 보장되지 않습니다.
+
 ```bash
 python skills/cursor-handoff/scripts/handoff.py \
   --workspace /path/to/project \

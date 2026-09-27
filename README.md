@@ -94,6 +94,8 @@ Quota or login failures are coordinator blockers — do not auto-switch models o
 2. Write a UTF-8 task file inside the target workspace (see `examples/task.md`).
 3. Dispatch:
 
+To conserve planner tokens, let Cursor explore the code and run validation. The planner reads project rules and enough context to set scope, then reviews Cursor's concise result and the relevant diff. Read full logs only when an error or risk calls for them. Claude consultation is optional and uses Claude tokens when requested; total token or cost savings are not guaranteed.
+
 ```bash
 python skills/cursor-handoff/scripts/handoff.py \
   --workspace /path/to/project \

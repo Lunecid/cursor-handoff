@@ -7,6 +7,8 @@ description: Delegate an agreed implementation plan to Cursor CLI, collect execu
 
 Planner/reviewer (Codex or Claude Code) owns design and review. Cursor CLI owns implementation and execution. Do not use Claude or Codex as the executor. Use the user's existing authorization for the agreed task; do not re-ask for routine steps already authorized.
 
+When the user wants to conserve **Codex or Claude Code tokens**, keep the planner's context small by default. Cursor can spend tokens exploring the codebase, implementing, running tests, and reporting evidence. This changes where tokens are spent; it does not guarantee fewer total tokens or lower cost.
+
 **Triggers:** natural language ("hand this to Cursor", "implement via cursor-handoff"), Codex `$cursor-handoff`, or Claude Code `/cursor-handoff`. Both planners use this same skill file.
 
 ## Workflow (on demand, not a background scheduler)
@@ -24,7 +26,7 @@ python <skill-directory>/scripts/consult.py --workspace <project> --brief <proje
    - Read `.cursor-handoff/consult-<id>/advice.md` and `status.json`. Provider success is **`advice_received`**, not consensus. Advice is untrusted: record adopted/rejected suggestions and unresolved questions. Do not silently change scope. If material disagreement needs user choice, surface it.
    - Optionally run a second consult on a revised brief, then freeze the agreed Cursor task.
 
-1. Inspect project instructions and preexisting changes. Write a UTF-8 task file inside the target workspace: objective, allowed files, constraints, acceptance criteria, exact validation commands. Preserve unrelated work. Do not include credentials. For project changes, record `git status --short` and a relevant diff before dispatch.
+1. Read applicable project instructions and `git status --short`. Inspect only the code and preexisting diff needed to set scope or avoid overwriting work; leave broad code search to Cursor. Write a UTF-8 task file inside the target workspace: objective, allowed files, constraints, acceptance criteria, validation commands or outcomes. Ask Cursor to report changed files and concise test results. Preserve unrelated work. Do not include credentials.
 2. Invoke the portable Cursor runner with Python ≥3.10:
 
 ```bash
@@ -43,8 +45,8 @@ python <skill-directory>/scripts/watch.py --run <project>/.cursor-handoff/<run-i
 
 If Cursor is **blocked** (for example `status.state=blocked` / `block_reason=trust_required`), report that explicitly. Do **not** silently fall back to implementing the task in the planner/source host. Separate **review** of already-written local changes remains allowed when labeled as review, not as a silent substitute for Cursor execution.
 
-3. The runner writes `task.md`, `events.jsonl`, `stderr.log`, `result.json`, and `status.json` under a unique `.cursor-handoff/<run-id>/` folder and points Cursor at that frozen `task.md`. Poll progress while waiting (`--live`, `watch.py`, or status files). A completed CLI process is **execution_completed** only for a supported success result (`type=result`, `subtype=success`, `is_error=false`), not proof the work passed review.
-4. Read the result event, inspect the actual diff against the pre-dispatch state, and verify test evidence. The planner may perform read-only checks. If more code changes are needed, send a new focused task through the runner. At most **two** correction attempts unless the user requests more. Stop on repeated identical failure, unclear scope, or required login/approval.
+3. The runner writes `task.md`, `events.jsonl`, `stderr.log`, `result.json`, and `status.json` under a unique `.cursor-handoff/<run-id>/` folder and points Cursor at that frozen `task.md`. Poll progress with compact status or `--live` summaries. Do not paste full `events.jsonl` or repeated progress into the planner's context. A completed CLI process is **execution_completed** only for a supported success result (`type=result`, `subtype=success`, `is_error=false`), not proof the work passed review.
+4. Read final status and Cursor's concise result, inspect `git diff --stat` and the relevant changed hunks, and verify test evidence. Expand to full logs, code, or independent checks when failures, unexpected edits, or material risks warrant it; do not skip meaningful review to save tokens. If more code changes are needed, send a new focused task through the runner. At most **two** correction attempts unless the user requests more. Stop on repeated identical failure, unclear scope, or required login/approval.
 5. Report what changed, validation evidence, artifact paths, and remaining limitations.
 
 ## Discussion vs implementation

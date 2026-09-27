@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -62,9 +63,8 @@ def make_agent_launcher(dir_path: Path) -> Path:
         return ps1
     script = dir_path / "agent"
     script.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, runpy\n"
-        "runpy.run_path(os.environ['FAKE_AGENT_PY'], run_name='__main__')\n",
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(str(FAKE_AGENT))} \"$@\"\n",
         encoding="utf-8",
         newline="\n",
     )

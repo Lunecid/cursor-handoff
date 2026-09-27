@@ -35,7 +35,7 @@ python <skill-directory>/scripts/handoff.py --workspace <project> --task <projec
 
 Optional: `--timeout` (default 600), `--model`, `--agent-path` / `CURSOR_AGENT_PATH`, `--trust-workspace` (default off), `--live`, `--open-terminal`, `--dry-run`, `--doctor`. The task must resolve inside the workspace.
 
-**Visible execution:** when the user wants to watch Cursor progress, use `--live --open-terminal` on Windows (separate console running `watch.py`). Elsewhere use `--live` and, if useful, give the manual watch command:
+**Visible execution:** on Windows use `--open-terminal` for a separate console running `watch.py`. When conserving planner tokens, omit `--live`: it also streams every tool summary into the planner's captured output. Elsewhere give the manual watch command for a separate terminal; use `--live` only when its output is needed in the planner's terminal:
 
 ```bash
 python <skill-directory>/scripts/watch.py --run <project>/.cursor-handoff/<run-id>

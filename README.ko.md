@@ -94,7 +94,7 @@ python skills/cursor-handoff/scripts/consult.py \
 2. 대상 워크스페이스 안에 UTF-8 작업 파일을 작성합니다(`examples/task.md` 참고).
 3. 실행:
 
-Codex·Claude Code 토큰을 아끼려면 코드 탐색과 검증은 Cursor에 맡기고, 설계자는 작업 범위에 필요한 규칙·맥락만 읽은 뒤 Cursor의 간결한 결과와 관련 변경 diff를 검토합니다. 오류나 위험이 있을 때만 전체 로그를 펼칩니다. Claude 논의는 요청 시에만 수행하며 Claude 토큰을 사용합니다. 총 토큰 또는 비용 절감은 보장되지 않습니다.
+Codex·Claude Code 토큰을 아끼려면 코드 탐색과 검증은 Cursor에 맡기고, 설계자는 작업 범위에 필요한 규칙·맥락만 읽은 뒤 Cursor의 간결한 결과와 관련 변경 diff를 검토합니다. 오류나 위험이 있을 때만 전체 로그를 펼칩니다. Windows에서는 `--live` 없이 `--open-terminal`만 쓰면 진행 문구가 설계자의 대화로 들어오지 않고 별도 창에 표시됩니다. Claude 논의는 요청 시에만 수행하며 Claude 토큰을 사용합니다. 총 토큰 또는 비용 절감은 보장되지 않습니다.
 
 ```bash
 python skills/cursor-handoff/scripts/handoff.py \
@@ -116,11 +116,11 @@ python skills/cursor-handoff/scripts/handoff.py \
 가시적 관찰(관찰 전용; trust 프롬프트에 응답할 수 없음):
 
 ```bash
-# Windows: live 진행 + 별도 뷰어 콘솔
+# Windows: 별도 뷰어 콘솔; 설계자 출력은 간결하게 유지
 python skills/cursor-handoff/scripts/handoff.py \
   --workspace /path/to/project \
   --task /path/to/project/.cursor-handoff-task.md \
-  --live --open-terminal
+  --open-terminal
 
 # Linux/macOS: live 진행; 필요 시 수동 뷰어
 python skills/cursor-handoff/scripts/handoff.py \

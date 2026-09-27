@@ -132,6 +132,8 @@ python skills/cursor-handoff/scripts/watch.py --run /path/to/project/.cursor-han
 
 Artifacts land in `.cursor-handoff/<run-id>/` (`task.md`, `events.jsonl`, `stderr.log`, `result.json`, `status.json`). The runner points Cursor at the frozen `run/task.md` snapshot. Treat logs as private. A CLI `execution_completed` state means the agent finished with a supported success result (`type=result`, `subtype=success`, `is_error=false`); it is **not** automatic review acceptance. Explicit workspace-trust denial becomes `blocked` / `trust_required` (nonzero exit). If consent was already rejected, do not bypass it; if trust was never configured, deliberately re-run with `--trust-workspace` for that exact workspace (Cursor may persist `.workspace-trusted`) or complete interactive Cursor trust setup. The runner never auto-enables `--trust`.
 
+On Windows, Cursor is spawned with a copied env that drops `MSYSTEM` when present so a parent Git Bash session cannot make PowerShell hooks run under Bash; the parent process env and auth/plugin/hook configs are untouched. POSIX preserves the child env copy as-is. When a tool-call result/error field reports a pre-tool hook rejection, the run becomes `blocked` / `hook_blocked` (nonzero exit) even if the final result looks successful — inspect `events.jsonl`; do not auto-bypass the denial. Benign mentions of hooks outside those fields are ignored. Timeout and interruption still win over `hook_blocked`.
+
 ## Offline checks
 
 ```bash
@@ -170,6 +172,7 @@ Creates deterministic `dist/cursor-handoff-<version>.zip` and `.sha256`. Extract
 | Agent not found / stale PATH | `--doctor`, `--agent-path`, or `CURSOR_AGENT_PATH`; on Windows check `%LOCALAPPDATA%\cursor-agent\agent.ps1` |
 | Claude CLI not found | `consult.py --doctor`, `--claude-path`, or `CLAUDE_CODE_PATH`; prefer a native `.exe` on Windows |
 | Trust / permission prompts | Pass `--trust-workspace` only when intentional (may persist `.workspace-trusted`); workspace path is not an OS sandbox. Viewer cannot answer trust prompts. `blocked`/`trust_required` means explicit denial — do not auto-retry or bypass rejected consent |
+| Tools blocked but CLI reports success | `blocked`/`hook_blocked` — check `hook_block_evidence` and `events.jsonl`. On Windows with Git Bash, confirm `MSYSTEM` was stripped from the Cursor child (`windows_shell_marker_removed`). Do not globally disable hooks or bypass an intentional denial |
 | Login / quota required | Run the relevant CLI login on the host; do not bypass or auto-switch providers |
 | Timeout | Raise `--timeout`; inspect `stderr.log` and `status.json` (`timeout` is retained) |
 | Lock exists | Another handoff/consult may be running, or a stale `.cursor-handoff/workspace.lock` remains — confirm no runner, then remove the lock manually |

@@ -132,6 +132,8 @@ python skills/cursor-handoff/scripts/watch.py --run /path/to/project/.cursor-han
 
 산출물은 `.cursor-handoff/<run-id>/`에 저장됩니다(`task.md`, `events.jsonl`, `stderr.log`, `result.json`, `status.json`). 러너는 Cursor가 동결된 `run/task.md` 스냅샷을 읽도록 가리킵니다. 로그는 비공개로 취급하세요. CLI의 `execution_completed`는 지원되는 성공 result(`type=result`, `subtype=success`, `is_error=false`)로 끝났다는 뜻이며, 작업 결과의 자동 리뷰 승인이 아닙니다. 명시적 workspace-trust 거부는 `blocked` / `trust_required`(비정상 종료)로 기록됩니다. 이미 trust를 거부한 경우 그 결정을 우회하지 마세요. trust가 아직 설정되지 않았다면 해당 워크스페이스에만 `--trust-workspace`로 의도적으로 다시 실행하거나(Cursor가 `.workspace-trusted`를 남길 수 있음) Cursor 대화형 trust 설정을 완료하세요. 러너는 `--trust`를 자동으로 켜지 않습니다.
 
+Windows에서는 Cursor 자식 프로세스에 환경 변수 복사본을 넘기며, 부모에 `MSYSTEM`(Git Bash 마커)이 있으면 제거합니다. PowerShell용 훅이 Bash에서 실행되는 것을 막기 위함이며, 부모 `os.environ`과 인증/플러그인/훅 설정은 바꾸지 않습니다. POSIX는 자식 env 복사본을 그대로 유지합니다. 도구 호출의 result/error 필드가 pre-tool 훅 거부를 보고하면, 최종 result가 성공처럼 보여도 `blocked` / `hook_blocked`(비정상 종료)로 기록합니다 — `events.jsonl`을 확인하고 의도적 훅 거부를 우회하지 마세요. 해당 필드 밖의 단순한 hooks 언급은 무시합니다. timeout/interrupted가 `hook_blocked`보다 우선합니다.
+
 ## 오프라인 점검
 
 ```bash
@@ -170,6 +172,7 @@ python scripts/package_release.py
 | agent를 찾지 못함 / PATH 오래됨 | `--doctor`, `--agent-path`, 또는 `CURSOR_AGENT_PATH`; Windows는 `%LOCALAPPDATA%\cursor-agent\agent.ps1` 확인 |
 | Claude CLI를 찾지 못함 | `consult.py --doctor`, `--claude-path`, 또는 `CLAUDE_CODE_PATH`; Windows는 네이티브 `.exe` 권장 |
 | trust/권한 프롬프트 | 의도할 때만 `--trust-workspace` (`.workspace-trusted`가 남을 수 있음); 워크스페이스 경로는 OS 샌드박스가 아님. 뷰어는 trust 프롬프트에 응답할 수 없음. `blocked`/`trust_required`는 명시적 거부 — 자동 재시도·거부 우회 금지 |
+| 도구는 막혔는데 CLI는 성공 | `blocked`/`hook_blocked` — `hook_block_evidence`와 `events.jsonl` 확인. Windows+Git Bash면 Cursor 자식에서 `MSYSTEM` 제거 여부(`windows_shell_marker_removed`) 확인. 훅을 전역 비활성화하거나 의도적 거부를 우회하지 말 것 |
 | 로그인/쿼터 필요 | 호스트에서 해당 CLI 로그인; 우회하거나 제공자 자동 전환 금지 |
 | 타임아웃 | `--timeout` 상향; `stderr.log`와 `status.json`(`timeout` 유지) 확인 |
 | 잠금 존재 | 다른 handoff/consult가 실행 중이거나 `.cursor-handoff/workspace.lock`이 남음 — 러너 없음을 확인한 뒤 수동 삭제 |

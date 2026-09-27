@@ -17,6 +17,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import signal
 import shutil
@@ -46,6 +47,37 @@ CAPABILITY_FLAGS = REQUIRED_FLAGS + OPTIONAL_FLAGS
 WINDOWS_TASKKILL_TIMEOUT = 30.0
 WATCH_SCRIPT = _SCRIPTS_DIR / "watch.py"
 CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+WINDOWS_SHELL_MARKER = "MSYSTEM"
+_TOOL_EVENT_TYPES = frozenset(
+    {"tool_call", "tool-call", "tool_use", "tool-use", "tool_result", "tool-result"}
+)
+_SKIP_TOOL_WALK_KEYS = frozenset(
+    {
+        "args",
+        "arguments",
+        "input",
+        "prompt",
+        "command",
+        "contents",
+        "content_preview",
+        "diff",
+        "old_string",
+        "new_string",
+    }
+)
+# Narrow: tool result/error fields that say a pre-tool hook blocked the call.
+# Do not match benign prose that merely mentions hooks.
+HOOK_BLOCK_RE = re.compile(
+    r"(?:"
+    r"pre[\s_-]?tool[\s_-]?use.{0,120}(?:block|reject|den(?:y|ied)|stop(?:ped)?|prevent(?:ed)?)"
+    r"|(?:hook|hooks).{0,80}(?:block|reject|den(?:y|ied)|stop(?:ped)?|prevent(?:ed)?)"
+    r"(?:\s+(?:the\s+)?(?:tool|call|execution(?:\s+of\s+the\s+tool)?))?"
+    r"|(?:block|reject|den(?:y|ied)|stop(?:ped)?|prevent(?:ed)?).{0,60}"
+    r"(?:by\s+)?(?:a\s+|the\s+)?(?:pre[\s_-]?tool(?:[\s_-]?use)?|hook)"
+    r"|execution\s+(?:was\s+)?(?:blocked|rejected|denied|stopped|prevented).{0,40}hook"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class RunnerError(Exception):
@@ -493,6 +525,185 @@ def result_is_success(event: dict) -> bool:
     )
 
 
+def prepare_cursor_child_env() -> tuple[dict[str, str], bool]:
+    """Copy env for the Cursor agent child.
+
+    On Windows only, drop MSYSTEM when present so Git Bash markers from the
+    parent do not make cursor-agent compose PowerShell hooks but run them in
+    Bash. Does not mutate os.environ. POSIX keeps the env copy unchanged.
+    """
+    env = os.environ.copy()
+    removed = False
+    if os.name == "nt" and WINDOWS_SHELL_MARKER in env:
+        del env[WINDOWS_SHELL_MARKER]
+        removed = True
+    return env, removed
+
+
+def _collect_hook_scan_texts(obj: object, *, depth: int = 0, out: list[str] | None = None) -> list[str]:
+    """Gather string fields from tool result/error trees; skip args/payloads.
+
+    Successful tool payloads (success/ok true) only contribute explicit error-like
+    keys, so README/docs text in output/content cannot false-trigger.
+    """
+    if out is None:
+        out = []
+    if depth > 8 or obj is None:
+        return out
+    if isinstance(obj, str):
+        text = obj.strip()
+        if text:
+            out.append(text)
+        return out
+    if isinstance(obj, (int, float, bool)):
+        return out
+    if isinstance(obj, list):
+        for item in obj[:40]:
+            _collect_hook_scan_texts(item, depth=depth + 1, out=out)
+        return out
+    if not isinstance(obj, dict):
+        return out
+
+    error_keys = {
+        "error",
+        "errors",
+        "reason",
+        "denial",
+        "failure",
+        "failurereason",
+        "blockreason",
+        "blockedby",
+        "errormessage",
+        "stderr",
+    }
+    # Scanned only when the result looks failed (avoid docs text in success output).
+    failed_extra_keys = {
+        "message",
+        "messages",
+        "detail",
+        "details",
+        "output",
+        "status",
+        "result",
+    }
+    skip = {k.replace("_", "").replace("-", "") for k in _SKIP_TOOL_WALK_KEYS}
+
+    success_flag = obj.get("success")
+    if success_flag is None:
+        success_flag = obj.get("ok")
+    looks_failed = (
+        success_flag is False
+        or obj.get("is_error") is True
+        or obj.get("isError") is True
+        or obj.get("rejected") is True
+        or obj.get("blocked") is True
+        or obj.get("denied") is True
+    )
+    if not looks_failed:
+        for key in ("error", "errors", "failure", "failureReason", "failure_reason", "denial"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                looks_failed = True
+                break
+            if isinstance(value, (list, dict)) and value:
+                looks_failed = True
+                break
+
+    allowed = set(error_keys)
+    if looks_failed or success_flag is not True:
+        # Unknown / failed shapes: also scan message/output-like keys.
+        # Explicit success=True stays on error keys only.
+        if success_flag is not True:
+            allowed |= failed_extra_keys
+
+    for key, value in obj.items():
+        if not isinstance(key, str):
+            continue
+        lower = key.lower()
+        normalized = lower.replace("_", "").replace("-", "")
+        if normalized in skip or lower in _SKIP_TOOL_WALK_KEYS:
+            continue
+        if normalized in allowed or lower in allowed:
+            _collect_hook_scan_texts(value, depth=depth + 1, out=out)
+            continue
+        # Nested *ToolCall wrappers: walk non-arg children only.
+        if lower.endswith("toolcall") or normalized in {"toolcall", "tool"}:
+            if isinstance(value, dict):
+                nested = {
+                    k: v
+                    for k, v in value.items()
+                    if isinstance(k, str)
+                    and k.lower().replace("_", "").replace("-", "") not in skip
+                    and k.lower() not in _SKIP_TOOL_WALK_KEYS
+                }
+                _collect_hook_scan_texts(nested, depth=depth + 1, out=out)
+            else:
+                _collect_hook_scan_texts(value, depth=depth + 1, out=out)
+            continue
+        if normalized in {"success", "ok", "iserror", "rejected", "blocked", "denied"}:
+            if isinstance(value, bool):
+                continue
+            _collect_hook_scan_texts(value, depth=depth + 1, out=out)
+    return out
+
+
+def tool_event_indicates_hook_block(event: dict) -> str | None:
+    """Return a short evidence snippet if a tool event reports a hook block.
+
+    Only inspects tool_call / tool_result shaped events and their result/error
+    fields — never task prompts, assistant prose, or tool args payloads.
+    """
+    if not isinstance(event, dict):
+        return None
+    etype = event.get("type")
+    if etype not in _TOOL_EVENT_TYPES:
+        return None
+    texts = _collect_hook_scan_texts(event)
+    for text in texts:
+        if HOOK_BLOCK_RE.search(text):
+            snippet = " ".join(text.split())
+            if len(snippet) > 240:
+                snippet = snippet[:237] + "..."
+            return snippet
+    return None
+
+
+def hook_block_fields(evidence: str | None = None) -> dict:
+    payload = {
+        "state": "blocked",
+        "block_reason": "hook_blocked",
+        "error": (
+            "A tool-call result reported that a pre-tool hook rejected or blocked "
+            "execution, but the CLI still emitted a success-shaped outcome. "
+            "The runner does not treat that as execution_completed and does not "
+            "auto-bypass the hook denial."
+        ),
+        "next_action": (
+            "Inspect events.jsonl for the hook denial evidence. Fix or isolate "
+            "the conflicting hook/shell environment (on Windows, avoid Git Bash "
+            "MSYSTEM leaking into Cursor when PowerShell hooks are expected), "
+            "then re-run. Do not disable hooks globally or bypass an intentional denial."
+        ),
+    }
+    if evidence:
+        payload["hook_block_evidence"] = evidence
+    return payload
+
+
+def apply_hook_block_if_needed(status: dict) -> None:
+    """Mark blocked/hook_blocked unless timeout/interrupt (or trust block) already won."""
+    if status.get("state") in PROTECTED_STATES:
+        return
+    if status.get("state") == "blocked" and status.get("block_reason") == "trust_required":
+        return
+    if not status.get("hook_block_detected"):
+        return
+    evidence = status.get("hook_block_evidence")
+    if not isinstance(evidence, str):
+        evidence = None
+    status.update(hook_block_fields(evidence))
+
+
 def consume_stdout(
     stream,
     events_path: Path,
@@ -525,6 +736,14 @@ def consume_stdout(
                         progress.on_event(event)
                     except Exception:
                         pass
+                evidence = tool_event_indicates_hook_block(event)
+                if evidence:
+                    with status_lock:
+                        status["hook_block_detected"] = True
+                        if not status.get("hook_block_evidence"):
+                            status["hook_block_evidence"] = evidence
+                        if status.get("state") not in PROTECTED_STATES:
+                            save_status(status_file, status)
                 if event.get("type") != "result":
                     continue
                 atomic_write_json(result_path, event)
@@ -686,6 +905,8 @@ def finalize_success_state(status: dict) -> None:
         return
     if status.get("state") == "runner_error":
         return
+    if status.get("state") == "blocked":
+        return
     exit_code = status.get("exit_code")
     if exit_code not in (0, None) and exit_code != 0:
         status["state"] = "failed"
@@ -713,6 +934,9 @@ def finalize_success_state(status: dict) -> None:
                 "Result event is not a supported success "
                 "(need type=result, subtype=success, is_error=false)"
             )
+            return
+        if status.get("hook_block_detected"):
+            apply_hook_block_if_needed(status)
             return
         status["state"] = SUCCESS_STATE
         status["note"] = (
@@ -864,6 +1088,21 @@ def run_handoff(args: argparse.Namespace) -> int:
         if os.name != "nt":
             popen_kwargs["start_new_session"] = True
 
+        child_env, removed_shell_marker = prepare_cursor_child_env()
+        popen_kwargs["env"] = child_env
+        if removed_shell_marker:
+            status["windows_shell_marker_removed"] = True
+            status["windows_shell_marker"] = WINDOWS_SHELL_MARKER
+            status["windows_shell_marker_note"] = (
+                "Removed Windows shell marker MSYSTEM from Cursor child environment "
+                "so Git Bash does not force Bash hook execution for PowerShell hooks."
+            )
+            save_status(status_file, status)
+            if progress is not None:
+                progress.emit_line(
+                    "Windows shell marker MSYSTEM removed from Cursor child env"
+                )
+
         proc = subprocess.Popen(command, **popen_kwargs)
 
         status["pid"] = proc.pid
@@ -983,6 +1222,8 @@ def run_handoff(args: argparse.Namespace) -> int:
                     status["error"] = f"Reader failure: {reader_errors[0]}"
             # Trust denial after timeout/interrupt check inside helper.
             apply_trust_denial_if_needed(status, stderr_text)
+            # Hook denials observed in tool results override false success.
+            apply_hook_block_if_needed(status)
             if status.get("state") not in PROTECTED_STATES and status.get("state") != "blocked":
                 finalize_success_state(status)
             if "finished_at" not in status:

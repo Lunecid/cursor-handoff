@@ -54,6 +54,22 @@ def record_prompt_task(argv: list[str]) -> None:
     Path(record).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def record_child_env() -> None:
+    """Optionally dump selected env keys so tests can verify child isolation."""
+    path = os.environ.get("FAKE_AGENT_ENV_RECORD")
+    if not path:
+        return
+    keys = os.environ.get("FAKE_AGENT_ENV_KEYS", "MSYSTEM,HOME,USERPROFILE,PATH")
+    wanted = [k.strip() for k in keys.split(",") if k.strip()]
+    payload = {
+        "pid": os.getpid(),
+        "has_MSYSTEM": "MSYSTEM" in os.environ,
+        "MSYSTEM": os.environ.get("MSYSTEM"),
+        "env": {key: os.environ.get(key) for key in wanted},
+    }
+    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def spawn_descendant() -> None:
     """Spawn a long-lived child in the same process tree/group as this agent."""
     marker = os.environ.get("FAKE_AGENT_CHILD_MARKER")
@@ -105,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     record_prompt_task(argv)
+    record_child_env()
 
     sleep_s = float(os.environ.get("FAKE_AGENT_SLEEP", "0"))
     if mode == "child_hang":
@@ -135,6 +152,128 @@ def main(argv: list[str] | None = None) -> int:
                 "subtype": "success",
                 "is_error": False,
                 "session_id": "sess-unrelated",
+                "result": "ok",
+            }
+        )
+        return 0
+
+    if mode == "hook_blocked_success":
+        # Simulate PreToolUse denial on every tool while CLI still reports success.
+        emit({"type": "system", "subtype": "init", "session_id": "sess-hook"})
+        emit(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "I will use hooks carefully; this prose must not count.",
+                        }
+                    ]
+                },
+            }
+        )
+        emit(
+            {
+                "type": "tool_call",
+                "subtype": "started",
+                "call_id": "call-hook-1",
+                "session_id": "sess-hook",
+                "tool_call": {
+                    "readToolCall": {
+                        "args": {
+                            "path": "README.md",
+                            "note": "benign mention of hooks in args must not classify",
+                        }
+                    }
+                },
+            }
+        )
+        emit(
+            {
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": "call-hook-1",
+                "session_id": "sess-hook",
+                "tool_call": {
+                    "readToolCall": {
+                        "args": {"path": "README.md"},
+                        "result": {
+                            "success": False,
+                            "error": (
+                                "PreToolUse hook blocked this tool call: "
+                                "shell marker mismatch"
+                            ),
+                        },
+                    }
+                },
+            }
+        )
+        emit(
+            {
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": "call-hook-2",
+                "session_id": "sess-hook",
+                "tool_call": {
+                    "shellToolCall": {
+                        "args": {"command": "echo hooks are documented"},
+                        "result": {
+                            "success": False,
+                            "error": "Execution was blocked by a hook",
+                        },
+                    }
+                },
+            }
+        )
+        emit(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "session_id": "sess-hook",
+                "result": "done despite blocked tools",
+            }
+        )
+        return 0
+
+    if mode == "benign_hook_mention_success":
+        # Tool succeeds; assistant mentions hooks — must remain execution_completed.
+        emit(
+            {
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": "call-ok",
+                "tool_call": {
+                    "readToolCall": {
+                        "args": {"path": "a.txt"},
+                        "result": {
+                            "success": True,
+                            "content": "docs mention hooks as optional",
+                        },
+                    }
+                },
+            }
+        )
+        emit(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Hooks are configured for this project.",
+                        }
+                    ]
+                },
+            }
+        )
+        emit(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "session_id": "sess-benign-hook",
                 "result": "ok",
             }
         )

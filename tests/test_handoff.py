@@ -546,6 +546,171 @@ class HandoffTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("outside", (proc.stdout + proc.stderr).lower())
 
+    def test_msystem_child_env_isolation(self) -> None:
+        """Windows Cursor child drops MSYSTEM; POSIX preserves the parent env copy."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("handoff_msystem", HANDOFF)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        old = dict(os.environ)
+        os.environ["MSYSTEM"] = "MINGW64"
+        os.environ["CURSOR_HANDOFF_PROBE"] = "keep-me"
+        try:
+            child_env, removed = mod.prepare_cursor_child_env()
+            self.assertEqual(child_env.get("CURSOR_HANDOFF_PROBE"), "keep-me")
+            self.assertEqual(os.environ.get("MSYSTEM"), "MINGW64")
+            if os.name == "nt":
+                self.assertTrue(removed)
+                self.assertNotIn("MSYSTEM", child_env)
+            else:
+                self.assertFalse(removed)
+                self.assertEqual(child_env.get("MSYSTEM"), "MINGW64")
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+
+        task = self.write_task()
+        env_record = self.tmp / "child-env.json"
+        proc = self.run_handoff(
+            task,
+            extra=["--live"],
+            env={
+                "MSYSTEM": "MINGW64",
+                "FAKE_AGENT_ENV_RECORD": str(env_record),
+                "FAKE_AGENT_MODE": "success",
+            },
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(env_record.is_file(), "fake agent should record child env")
+        payload = json.loads(env_record.read_text(encoding="utf-8"))
+        status = self.latest_status()
+        if os.name == "nt":
+            self.assertFalse(payload.get("has_MSYSTEM"))
+            self.assertIsNone(payload.get("MSYSTEM"))
+            self.assertTrue(status.get("windows_shell_marker_removed"))
+            self.assertEqual(status.get("windows_shell_marker"), "MSYSTEM")
+            self.assertIn("MSYSTEM", status.get("windows_shell_marker_note", ""))
+            self.assertIn("MSYSTEM removed", proc.stderr)
+        else:
+            self.assertTrue(payload.get("has_MSYSTEM"))
+            self.assertEqual(payload.get("MSYSTEM"), "MINGW64")
+            self.assertFalse(status.get("windows_shell_marker_removed"))
+
+    def test_hook_blocked_false_success(self) -> None:
+        task = self.write_task()
+        proc = self.run_handoff(task, env={"FAKE_AGENT_MODE": "hook_blocked_success"})
+        self.assertNotEqual(proc.returncode, 0)
+        status = self.latest_status()
+        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status.get("block_reason"), "hook_blocked")
+        self.assertTrue(status.get("hook_block_detected"))
+        self.assertIn("PreToolUse", status.get("hook_block_evidence", ""))
+        events = (self.latest_run() / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn("PreToolUse hook blocked", events)
+        self.assertIn('"subtype": "success"', events)
+
+    def test_benign_hook_mention_still_success(self) -> None:
+        task = self.write_task()
+        proc = self.run_handoff(
+            task, env={"FAKE_AGENT_MODE": "benign_hook_mention_success"}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        status = self.latest_status()
+        self.assertEqual(status["state"], "execution_completed")
+        self.assertFalse(status.get("hook_block_detected"))
+
+    def test_hook_block_classifier_narrow(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("handoff_hook_cls", HANDOFF)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        blocked = mod.tool_event_indicates_hook_block(
+            {
+                "type": "tool_call",
+                "subtype": "completed",
+                "tool_call": {
+                    "readToolCall": {
+                        "args": {"path": "x", "note": "hooks are great"},
+                        "result": {
+                            "success": False,
+                            "error": "PreToolUse hook rejected this tool call",
+                        },
+                    }
+                },
+            }
+        )
+        self.assertIsNotNone(blocked)
+
+        benign_tool = mod.tool_event_indicates_hook_block(
+            {
+                "type": "tool_call",
+                "subtype": "completed",
+                "tool_call": {
+                    "readToolCall": {
+                        "result": {
+                            "success": True,
+                            "content": "This project documents hooks in README.",
+                        }
+                    }
+                },
+            }
+        )
+        self.assertIsNone(benign_tool)
+
+        # Successful payload text must not classify even if it quotes hook denials.
+        success_docs = mod.tool_event_indicates_hook_block(
+            {
+                "type": "tool_call",
+                "subtype": "completed",
+                "tool_call": {
+                    "readToolCall": {
+                        "result": {
+                            "success": True,
+                            "output": (
+                                "If tool-call result fields report a pre-tool hook "
+                                "rejection, the run becomes blocked / hook_blocked."
+                            ),
+                        }
+                    }
+                },
+            }
+        )
+        self.assertIsNone(success_docs)
+
+        assistant = mod.tool_event_indicates_hook_block(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "PreToolUse hook blocked this tool call",
+                        }
+                    ]
+                },
+            }
+        )
+        self.assertIsNone(assistant)
+
+        # Timeout / interrupt keep precedence over hook_blocked.
+        protected = {"state": "timeout", "hook_block_detected": True}
+        mod.apply_hook_block_if_needed(protected)
+        self.assertEqual(protected["state"], "timeout")
+
+        trust = {
+            "state": "blocked",
+            "block_reason": "trust_required",
+            "hook_block_detected": True,
+        }
+        mod.apply_hook_block_if_needed(trust)
+        self.assertEqual(trust["block_reason"], "trust_required")
+
 
 class VisibleExecutionTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -23,6 +23,8 @@ ALLOWLIST = [
     "skills/cursor-handoff/SKILL.md",
     "skills/cursor-handoff/scripts/handoff.py",
     "skills/cursor-handoff/scripts/consult.py",
+    "skills/cursor-handoff/scripts/progress.py",
+    "skills/cursor-handoff/scripts/watch.py",
     "install.py",
     "scripts/package_release.py",
     "README.md",

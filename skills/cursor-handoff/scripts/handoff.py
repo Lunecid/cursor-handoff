@@ -12,10 +12,12 @@ as failure. A prior error/malformed result is never replaced by a later success.
 from __future__ import annotations
 
 import argparse
+import codecs
 import datetime as dt
 import json
 import os
 from pathlib import Path
+import shlex
 import signal
 import shutil
 import subprocess
@@ -25,6 +27,16 @@ import threading
 import time
 import uuid
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from progress import (  # noqa: E402
+    ProgressReporter,
+    detect_trust_denial,
+    trust_block_fields,
+)
+
 PROTECTED_STATES = frozenset({"timeout", "interrupted"})
 SUCCESS_STATE = "execution_completed"
 LOCK_NAME = "workspace.lock"
@@ -32,6 +44,8 @@ REQUIRED_FLAGS = ("--print", "--output-format", "--workspace")
 OPTIONAL_FLAGS = ("--auto-review", "--trust", "--model")
 CAPABILITY_FLAGS = REQUIRED_FLAGS + OPTIONAL_FLAGS
 WINDOWS_TASKKILL_TIMEOUT = 30.0
+WATCH_SCRIPT = _SCRIPTS_DIR / "watch.py"
+CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
 
 
 class RunnerError(Exception):
@@ -487,6 +501,7 @@ def consume_stdout(
     status_file: Path,
     status_lock: threading.Lock,
     reader_errors: list,
+    progress: ProgressReporter | None = None,
 ) -> None:
     try:
         with events_path.open("wb") as out:
@@ -505,6 +520,11 @@ def consume_stdout(
                     continue
                 if not isinstance(event, dict):
                     continue
+                if progress is not None:
+                    try:
+                        progress.on_event(event)
+                    except Exception:
+                        pass
                 if event.get("type") != "result":
                     continue
                 atomic_write_json(result_path, event)
@@ -541,6 +561,124 @@ def consume_stdout(
                 save_status(status_file, status)
             except Exception as save_exc:
                 reader_errors.append(save_exc)
+
+
+def tee_stderr(
+    stream,
+    stderr_path: Path,
+    progress: ProgressReporter | None,
+    reader_errors: list,
+    accumulated: list[str],
+) -> None:
+    """Copy agent stderr to stderr.log and optional live progress.
+
+    Uses read1 (or equivalent) so small flushed writes appear before process exit,
+    and an incremental UTF-8 decoder so multi-byte sequences split across chunks
+    are handled correctly.
+    """
+    try:
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        read_chunk = getattr(stream, "read1", None)
+        with stderr_path.open("wb") as out:
+            while True:
+                if callable(read_chunk):
+                    chunk = read_chunk(4096)
+                else:
+                    chunk = stream.read(4096)
+                if not chunk:
+                    text = decoder.decode(b"", final=True)
+                    if text:
+                        accumulated.append(text)
+                        if progress is not None:
+                            try:
+                                progress.on_stderr_text(text)
+                            except Exception:
+                                pass
+                    break
+                out.write(chunk)
+                out.flush()
+                text = decoder.decode(chunk)
+                if not text:
+                    continue
+                accumulated.append(text)
+                if progress is not None:
+                    try:
+                        progress.on_stderr_text(text)
+                    except Exception:
+                        pass
+    except Exception as exc:
+        reader_errors.append(exc)
+
+
+def build_watch_command(run_dir: Path) -> list[str]:
+    return [
+        sys.executable,
+        "-X",
+        "utf8",
+        str(WATCH_SCRIPT),
+        "--run",
+        str(run_dir),
+        "--console",
+    ]
+
+
+def format_command_for_display(command: list[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(command)
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def launch_open_terminal(run_dir: Path) -> dict:
+    """Launch watch.py viewer. Windows: new console. Elsewhere: manual command only."""
+    command = build_watch_command(run_dir)
+    info: dict = {
+        "command": command,
+        "command_display": format_command_for_display(command),
+        "launched": False,
+    }
+    if os.name != "nt":
+        info["manual_command"] = info["command_display"]
+        info["note"] = (
+            "Desktop terminal launch is Windows-only; run the manual watch command "
+            "in a separate terminal, or rely on --live progress. "
+            "The viewer cannot answer Cursor trust prompts."
+        )
+        return info
+    try:
+        # Separate console; closing it must not kill the handoff process.
+        # list argv + shell=False — never build a command string.
+        # Do not redirect stdio to DEVNULL/PIPE: that blanks the new console.
+        # watch.py --console reopens CONIN$/CONOUT$ when the parent had pipes.
+        viewer = subprocess.Popen(
+            command,
+            shell=False,
+            cwd=str(run_dir),
+            creationflags=CREATE_NEW_CONSOLE,
+            close_fds=False,
+            # Explicitly leave stdin/stdout/stderr unset (inherit). Viewer
+            # attaches to its new console via --console / CONIN$+CONOUT$.
+        )
+        info["launched"] = True
+        info["pid"] = viewer.pid
+        info["note"] = (
+            "Viewer is observation only and cannot answer Cursor trust prompts."
+        )
+    except Exception as exc:
+        info["error"] = str(exc)
+        info["note"] = (
+            "Failed to open viewer console; continue with --live or run watch.py manually. "
+            "The viewer cannot answer Cursor trust prompts."
+        )
+    return info
+
+
+def apply_trust_denial_if_needed(status: dict, stderr_text: str) -> None:
+    """Mark blocked/trust_required unless timeout/interrupt already won."""
+    if status.get("state") in PROTECTED_STATES:
+        return
+    if not detect_trust_denial(stderr_text):
+        return
+    status.update(trust_block_fields())
 
 
 def finalize_success_state(status: dict) -> None:
@@ -588,6 +726,12 @@ def run_handoff(args: argparse.Namespace) -> int:
     if args.timeout < 1:
         raise RunnerError("Timeout must be a positive integer (seconds).")
 
+    live = bool(getattr(args, "live", False))
+    open_terminal = bool(getattr(args, "open_terminal", False))
+    # Non-Windows --open-terminal: report manual watch command and use live output.
+    if open_terminal and os.name != "nt":
+        live = True
+
     # Resolve agent before any cwd change for the child process.
     agent = discover_agent(args.agent_path)
     capabilities = probe_capabilities(agent)
@@ -611,12 +755,23 @@ def run_handoff(args: argparse.Namespace) -> int:
             "agent": str(agent),
             "timeout": args.timeout,
             "trust_workspace": bool(args.trust_workspace),
+            "live": live,
+            "open_terminal": open_terminal,
             "model": args.model,
             "command": command[:-1] + ["<prompt>"],
+            "watch_command_template": [
+                sys.executable,
+                "-X",
+                "utf8",
+                str(WATCH_SCRIPT),
+                "--run",
+                "<run-dir>",
+            ],
             "notes": [
                 "Dry-run does not create run folders, locks, or mutate the workspace.",
                 "Task contents are intentionally omitted.",
                 "Workspace path is not an OS sandbox; host approval and Cursor permissions still apply.",
+                "Viewer is observation only and cannot answer Cursor trust prompts.",
             ],
             "capabilities": {
                 "version": capabilities.get("version"),
@@ -637,13 +792,17 @@ def run_handoff(args: argparse.Namespace) -> int:
         "started_at": utc_now(),
         "trust_workspace": bool(args.trust_workspace),
         "agent": str(agent),
+        "live": live,
+        "open_terminal": open_terminal,
     }
     status_file = run_dir / "status.json"
     status_lock = threading.Lock()
     proc: subprocess.Popen[bytes] | None = None
-    stderr_handle = None
     reader: threading.Thread | None = None
+    stderr_reader: threading.Thread | None = None
     reader_errors: list = []
+    stderr_chunks: list[str] = []
+    progress: ProgressReporter | None = ProgressReporter() if live else None
     exit_status = 1
 
     try:
@@ -666,34 +825,54 @@ def run_handoff(args: argparse.Namespace) -> int:
         )
         status["task_snapshot"] = frozen_rel
         save_status(status_file, status)
+        # stdout JSON stays compatible: first line is still the running notice.
         emit_json({"run": str(run_dir), "state": "running"})
+
+        if progress is not None:
+            progress.announce_start(
+                workspace=str(workspace),
+                task_snapshot=frozen_rel,
+                trust_workspace=bool(args.trust_workspace),
+                run_dir=str(run_dir),
+            )
+
+        # Launch viewer before Cursor so trust prompts are visible separately.
+        if open_terminal:
+            viewer_info = launch_open_terminal(run_dir)
+            status["viewer"] = {
+                k: v
+                for k, v in viewer_info.items()
+                if k != "command" or isinstance(v, list)
+            }
+            # Keep argv list for tests; also store display string.
+            status["viewer"]["command"] = viewer_info.get("command")
+            save_status(status_file, status)
+            if progress is not None:
+                progress.announce_viewer(viewer_info)
+            elif viewer_info.get("manual_command") or viewer_info.get("error"):
+                # Surface non-Windows guidance even without --live.
+                emit_progress = ProgressReporter()
+                emit_progress.announce_viewer(viewer_info)
 
         popen_kwargs: dict = {
             "cwd": str(workspace),
             "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
             "stdin": subprocess.DEVNULL,
             "shell": False,
         }
         if os.name != "nt":
             popen_kwargs["start_new_session"] = True
 
-        try:
-            stderr_handle = (run_dir / "stderr.log").open("wb")
-            popen_kwargs["stderr"] = stderr_handle
-            proc = subprocess.Popen(command, **popen_kwargs)
-        except Exception:
-            if stderr_handle is not None:
-                try:
-                    stderr_handle.close()
-                except Exception:
-                    pass
-                stderr_handle = None
-            raise
+        proc = subprocess.Popen(command, **popen_kwargs)
 
         status["pid"] = proc.pid
         save_status(status_file, status)
+        if progress is not None:
+            progress.announce_pid(proc.pid)
 
         assert proc.stdout is not None
+        assert proc.stderr is not None
         reader = threading.Thread(
             target=consume_stdout,
             args=(
@@ -704,11 +883,24 @@ def run_handoff(args: argparse.Namespace) -> int:
                 status_file,
                 status_lock,
                 reader_errors,
+                progress,
+            ),
+            daemon=True,
+        )
+        stderr_reader = threading.Thread(
+            target=tee_stderr,
+            args=(
+                proc.stderr,
+                run_dir / "stderr.log",
+                progress,
+                reader_errors,
+                stderr_chunks,
             ),
             daemon=True,
         )
         try:
             reader.start()
+            stderr_reader.start()
         except Exception:
             kill_process_tree(proc)
             raise
@@ -748,6 +940,8 @@ def run_handoff(args: argparse.Namespace) -> int:
         finally:
             if reader is not None:
                 reader.join(timeout=30)
+            if stderr_reader is not None:
+                stderr_reader.join(timeout=30)
             if proc is not None:
                 if proc.stdout is not None:
                     try:
@@ -755,29 +949,48 @@ def run_handoff(args: argparse.Namespace) -> int:
                     except Exception:
                         pass
                     proc.stdout = None
+                if proc.stderr is not None:
+                    try:
+                        proc.stderr.close()
+                    except Exception:
+                        pass
+                    proc.stderr = None
                 if proc.poll() is None:
                     kill_process_tree(proc)
-            if stderr_handle is not None:
-                try:
-                    stderr_handle.close()
-                except Exception:
-                    pass
-                stderr_handle = None
+
+        stderr_text = "".join(stderr_chunks)
+        if not stderr_text:
+            try:
+                stderr_text = (run_dir / "stderr.log").read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                stderr_text = ""
 
         with status_lock:
             if reader is not None and reader.is_alive():
                 if status.get("state") not in PROTECTED_STATES:
                     status["state"] = "runner_error"
                 status["error"] = "Reader thread did not finish before status finalization"
+            elif stderr_reader is not None and stderr_reader.is_alive():
+                if status.get("state") not in PROTECTED_STATES:
+                    status["state"] = "runner_error"
+                status["error"] = "Stderr reader thread did not finish before status finalization"
             elif reader_errors:
                 if status.get("state") not in PROTECTED_STATES:
                     status["state"] = "runner_error"
                 if not status.get("error"):
                     status["error"] = f"Reader failure: {reader_errors[0]}"
-            finalize_success_state(status)
+            # Trust denial after timeout/interrupt check inside helper.
+            apply_trust_denial_if_needed(status, stderr_text)
+            if status.get("state") not in PROTECTED_STATES and status.get("state") != "blocked":
+                finalize_success_state(status)
             if "finished_at" not in status:
                 status["finished_at"] = utc_now()
             save_status(status_file, status)
+
+        if progress is not None:
+            progress.on_status(status)
 
         emit_json(status)
         return 0 if status.get("state") == SUCCESS_STATE else 1
@@ -822,14 +1035,20 @@ def run_handoff(args: argparse.Namespace) -> int:
                 proc.stdout = None
             except Exception:
                 pass
-        if stderr_handle is not None:
+        if proc is not None and getattr(proc, "stderr", None) is not None:
             try:
-                stderr_handle.close()
+                proc.stderr.close()
             except Exception:
                 pass
-        # Confirm reader completion before releasing the workspace lock.
+            try:
+                proc.stderr = None
+            except Exception:
+                pass
+        # Confirm readers complete before releasing the workspace lock.
         if reader is not None and reader.is_alive():
             reader.join(timeout=5)
+        if stderr_reader is not None and stderr_reader.is_alive():
+            stderr_reader.join(timeout=5)
         release_lock(lock_path, os.getpid())
 
 
@@ -884,7 +1103,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trust-workspace",
         action="store_true",
-        help="Pass Cursor --trust for this workspace only (default: off)",
+        help=(
+            "Deliberately pass Cursor --trust for this exact workspace (default: off). "
+            "Cursor may persist a .workspace-trusted marker; not a silent per-run toggle."
+        ),
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Print human progress to stderr; stdout JSON stays compatible",
+    )
+    parser.add_argument(
+        "--open-terminal",
+        action="store_true",
+        help=(
+            "Windows: open a separate console running watch.py for this run before Cursor. "
+            "Other OS: print a manual watch command and enable live progress. "
+            "Viewer is observation only and cannot answer trust prompts."
+        ),
     )
     parser.add_argument(
         "--dry-run",

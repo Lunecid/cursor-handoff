@@ -121,6 +121,54 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("fake agent failed\n")
         return 7
 
+    if mode == "trust_denied":
+        sys.stderr.write(
+            "Error: Workspace Trust is required. User declined workspace trust.\n"
+        )
+        return 2
+
+    if mode == "unrelated_stderr":
+        sys.stderr.write("FAIL: test_trust_helper assertion failed\n")
+        emit(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "session_id": "sess-unrelated",
+                "result": "ok",
+            }
+        )
+        return 0
+
+    if mode == "progress_events":
+        emit({"type": "system", "subtype": "init", "session_id": "sess-progress"})
+        emit({"type": "thinking", "text": "secret chain of thought - must not render"})
+        emit(
+            {
+                "type": "reasoning",
+                "summary": "also must not render",
+            }
+        )
+        emit(
+            {
+                "type": "tool_call",
+                "subtype": "started",
+                "session_id": "sess-progress",
+                "tool_call": {"shellToolCall": {"args": {"command": "secret payload"}}},
+            }
+        )
+        time.sleep(float(os.environ.get("FAKE_AGENT_PROGRESS_SLEEP", "0.4")))
+        emit(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "session_id": "sess-progress",
+                "result": "done",
+            }
+        )
+        return 0
+
     if mode == "missing":
         emit({"type": "system", "message": "no result will be sent"})
         return 0

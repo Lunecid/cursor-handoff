@@ -105,11 +105,30 @@ Useful flags:
 - `--timeout 600` — process-tree kill deadline
 - `--model <id>` — optional Cursor model
 - `--agent-path` / `CURSOR_AGENT_PATH` — executable or Windows `agent.ps1`
-- `--trust-workspace` — opt in to Cursor `--trust` for this run only (default off)
+- `--trust-workspace` — deliberately pass Cursor `--trust` for this exact workspace (default off). May persist a `.workspace-trusted` marker that subdirectories inherit — not a silent per-run-only switch; never auto-enabled
+- `--live` — human progress on stderr (workspace, task, trust flag, pid/session, tool summaries, stderr errors, final state); stdout JSON stays compatible
+- `--open-terminal` — Windows: open a separate console running `watch.py` before Cursor; other OS: print a manual watch command and enable live progress
 - `--dry-run` — validate and print dispatch plan; no runs/locks/mutations
 - `--doctor` — installation/capability report; no login or config writes
 
-Artifacts land in `.cursor-handoff/<run-id>/` (`task.md`, `events.jsonl`, `stderr.log`, `result.json`, `status.json`). The runner points Cursor at the frozen `run/task.md` snapshot. Treat logs as private. A CLI `execution_completed` state means the agent finished with a supported success result (`type=result`, `subtype=success`, `is_error=false`); it is **not** automatic review acceptance.
+Visible watch (observation only; cannot answer trust prompts):
+
+```bash
+# Windows: live progress + separate viewer console
+python skills/cursor-handoff/scripts/handoff.py \
+  --workspace /path/to/project \
+  --task /path/to/project/.cursor-handoff-task.md \
+  --live --open-terminal
+
+# Linux/macOS: live progress; optional manual viewer
+python skills/cursor-handoff/scripts/handoff.py \
+  --workspace /path/to/project \
+  --task /path/to/project/.cursor-handoff-task.md \
+  --live
+python skills/cursor-handoff/scripts/watch.py --run /path/to/project/.cursor-handoff/<run-id>
+```
+
+Artifacts land in `.cursor-handoff/<run-id>/` (`task.md`, `events.jsonl`, `stderr.log`, `result.json`, `status.json`). The runner points Cursor at the frozen `run/task.md` snapshot. Treat logs as private. A CLI `execution_completed` state means the agent finished with a supported success result (`type=result`, `subtype=success`, `is_error=false`); it is **not** automatic review acceptance. Explicit workspace-trust denial becomes `blocked` / `trust_required` (nonzero exit). If consent was already rejected, do not bypass it; if trust was never configured, deliberately re-run with `--trust-workspace` for that exact workspace (Cursor may persist `.workspace-trusted`) or complete interactive Cursor trust setup. The runner never auto-enables `--trust`.
 
 ## Offline checks
 
@@ -118,6 +137,20 @@ python skills/cursor-handoff/scripts/handoff.py --doctor
 python skills/cursor-handoff/scripts/consult.py --doctor
 python skills/cursor-handoff/scripts/handoff.py --workspace . --task examples/task.md --dry-run
 python skills/cursor-handoff/scripts/consult.py --workspace . --brief examples/design-brief.md --dry-run
+```
+
+## Validation
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Default tests use mocked launchers and never open a real console window. The real Windows GUI handshake (`test_windows_viewer_console_handshake`) is opt-in:
+
+```bash
+# Windows only; opens a CREATE_NEW_CONSOLE viewer window
+set CURSOR_HANDOFF_TEST_GUI=1
+python -m unittest tests.test_handoff.VisibleExecutionTests.test_windows_viewer_console_handshake -v
 ```
 
 ## Package a release
@@ -134,7 +167,7 @@ Creates deterministic `dist/cursor-handoff-<version>.zip` and `.sha256`. Extract
 | --- | --- |
 | Agent not found / stale PATH | `--doctor`, `--agent-path`, or `CURSOR_AGENT_PATH`; on Windows check `%LOCALAPPDATA%\cursor-agent\agent.ps1` |
 | Claude CLI not found | `consult.py --doctor`, `--claude-path`, or `CLAUDE_CODE_PATH`; prefer a native `.exe` on Windows |
-| Trust / permission prompts | Pass `--trust-workspace` only when intentional; workspace path is not an OS sandbox |
+| Trust / permission prompts | Pass `--trust-workspace` only when intentional (may persist `.workspace-trusted`); workspace path is not an OS sandbox. Viewer cannot answer trust prompts. `blocked`/`trust_required` means explicit denial — do not auto-retry or bypass rejected consent |
 | Login / quota required | Run the relevant CLI login on the host; do not bypass or auto-switch providers |
 | Timeout | Raise `--timeout`; inspect `stderr.log` and `status.json` (`timeout` is retained) |
 | Lock exists | Another handoff/consult may be running, or a stale `.cursor-handoff/workspace.lock` remains — confirm no runner, then remove the lock manually |

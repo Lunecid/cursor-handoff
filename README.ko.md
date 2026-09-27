@@ -105,11 +105,30 @@ python skills/cursor-handoff/scripts/handoff.py \
 - `--timeout 600` — 프로세스 트리 종료 시한
 - `--model <id>` — 선택적 Cursor 모델
 - `--agent-path` / `CURSOR_AGENT_PATH` — 실행 파일 또는 Windows `agent.ps1`
-- `--trust-workspace` — 이번 실행에만 Cursor `--trust` 사용(기본 off)
+- `--trust-workspace` — 해당 워크스페이스에 Cursor `--trust`를 의도적으로 전달(기본 off). `.workspace-trusted` 마커가 남을 수 있고 하위 디렉터리가 상속할 수 있음 — 조용한 일회성(per-run) 스위치가 아니며 자동으로 켜지 않음
+- `--live` — stderr에 사람용 진행 상황(워크스페이스, task, trust 플래그, pid/session, 도구 요약, stderr 오류, 최종 상태); stdout JSON 호환 유지
+- `--open-terminal` — Windows: Cursor 전에 `watch.py`를 별도 콘솔로 실행; 다른 OS: 수동 watch 명령을 출력하고 live 진행 활성화
 - `--dry-run` — 검증·계획만 출력; run/lock/변경 없음
 - `--doctor` — 설치/기능 보고; 로그인·설정 쓰기 없음
 
-산출물은 `.cursor-handoff/<run-id>/`에 저장됩니다(`task.md`, `events.jsonl`, `stderr.log`, `result.json`, `status.json`). 러너는 Cursor가 동결된 `run/task.md` 스냅샷을 읽도록 가리킵니다. 로그는 비공개로 취급하세요. CLI의 `execution_completed`는 지원되는 성공 result(`type=result`, `subtype=success`, `is_error=false`)로 끝났다는 뜻이며, 작업 결과의 자동 리뷰 승인이 아닙니다.
+가시적 관찰(관찰 전용; trust 프롬프트에 응답할 수 없음):
+
+```bash
+# Windows: live 진행 + 별도 뷰어 콘솔
+python skills/cursor-handoff/scripts/handoff.py \
+  --workspace /path/to/project \
+  --task /path/to/project/.cursor-handoff-task.md \
+  --live --open-terminal
+
+# Linux/macOS: live 진행; 필요 시 수동 뷰어
+python skills/cursor-handoff/scripts/handoff.py \
+  --workspace /path/to/project \
+  --task /path/to/project/.cursor-handoff-task.md \
+  --live
+python skills/cursor-handoff/scripts/watch.py --run /path/to/project/.cursor-handoff/<run-id>
+```
+
+산출물은 `.cursor-handoff/<run-id>/`에 저장됩니다(`task.md`, `events.jsonl`, `stderr.log`, `result.json`, `status.json`). 러너는 Cursor가 동결된 `run/task.md` 스냅샷을 읽도록 가리킵니다. 로그는 비공개로 취급하세요. CLI의 `execution_completed`는 지원되는 성공 result(`type=result`, `subtype=success`, `is_error=false`)로 끝났다는 뜻이며, 작업 결과의 자동 리뷰 승인이 아닙니다. 명시적 workspace-trust 거부는 `blocked` / `trust_required`(비정상 종료)로 기록됩니다. 이미 trust를 거부한 경우 그 결정을 우회하지 마세요. trust가 아직 설정되지 않았다면 해당 워크스페이스에만 `--trust-workspace`로 의도적으로 다시 실행하거나(Cursor가 `.workspace-trusted`를 남길 수 있음) Cursor 대화형 trust 설정을 완료하세요. 러너는 `--trust`를 자동으로 켜지 않습니다.
 
 ## 오프라인 점검
 
@@ -118,6 +137,20 @@ python skills/cursor-handoff/scripts/handoff.py --doctor
 python skills/cursor-handoff/scripts/consult.py --doctor
 python skills/cursor-handoff/scripts/handoff.py --workspace . --task examples/task.md --dry-run
 python skills/cursor-handoff/scripts/consult.py --workspace . --brief examples/design-brief.md --dry-run
+```
+
+## 검증
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+기본 테스트는 mock 런처를 쓰며 실제 콘솔 창을 열지 않습니다. 실제 Windows GUI 핸드셰이크(`test_windows_viewer_console_handshake`)는 옵트인입니다:
+
+```bash
+# Windows 전용; CREATE_NEW_CONSOLE 뷰어 창을 엽니다
+set CURSOR_HANDOFF_TEST_GUI=1
+python -m unittest tests.test_handoff.VisibleExecutionTests.test_windows_viewer_console_handshake -v
 ```
 
 ## 릴리스 패키징
@@ -134,7 +167,7 @@ python scripts/package_release.py
 | --- | --- |
 | agent를 찾지 못함 / PATH 오래됨 | `--doctor`, `--agent-path`, 또는 `CURSOR_AGENT_PATH`; Windows는 `%LOCALAPPDATA%\cursor-agent\agent.ps1` 확인 |
 | Claude CLI를 찾지 못함 | `consult.py --doctor`, `--claude-path`, 또는 `CLAUDE_CODE_PATH`; Windows는 네이티브 `.exe` 권장 |
-| trust/권한 프롬프트 | 의도할 때만 `--trust-workspace`; 워크스페이스 경로는 OS 샌드박스가 아님 |
+| trust/권한 프롬프트 | 의도할 때만 `--trust-workspace` (`.workspace-trusted`가 남을 수 있음); 워크스페이스 경로는 OS 샌드박스가 아님. 뷰어는 trust 프롬프트에 응답할 수 없음. `blocked`/`trust_required`는 명시적 거부 — 자동 재시도·거부 우회 금지 |
 | 로그인/쿼터 필요 | 호스트에서 해당 CLI 로그인; 우회하거나 제공자 자동 전환 금지 |
 | 타임아웃 | `--timeout` 상향; `stderr.log`와 `status.json`(`timeout` 유지) 확인 |
 | 잠금 존재 | 다른 handoff/consult가 실행 중이거나 `.cursor-handoff/workspace.lock`이 남음 — 러너 없음을 확인한 뒤 수동 삭제 |

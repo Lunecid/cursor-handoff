@@ -711,6 +711,142 @@ class HandoffTests(unittest.TestCase):
         mod.apply_hook_block_if_needed(trust)
         self.assertEqual(trust["block_reason"], "trust_required")
 
+    def _load_handoff(self):
+        import importlib.util
+
+        mod_name = f"handoff_atomic_{id(self)}_{time.time_ns()}"
+        spec = importlib.util.spec_from_file_location(mod_name, HANDOFF)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod_name, mod
+
+    @staticmethod
+    def _windows_os_error(winerror: int, message: str) -> OSError:
+        err = OSError(winerror, message)
+        err.winerror = winerror
+        return err
+
+    def test_atomic_write_retries_transient_windows_replace(self) -> None:
+        from unittest import mock
+
+        mod_name, mod = self._load_handoff()
+        target = self.tmp / "status.json"
+        target.write_text("old\n", encoding="utf-8")
+        calls = {"n": 0}
+        real_replace = os.replace
+
+        def flaky_replace(src, dst):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise self._windows_os_error(5, "Access is denied")
+            return real_replace(src, dst)
+
+        clock = {"t": 0.0}
+
+        def mono() -> float:
+            return clock["t"]
+
+        def sleep(dt: float) -> None:
+            clock["t"] += dt
+
+        try:
+            with (
+                mock.patch.object(mod.os, "name", "nt"),
+                mock.patch.object(mod.os, "replace", side_effect=flaky_replace),
+                mock.patch.object(mod.time, "sleep", side_effect=sleep),
+                mock.patch.object(mod.time, "monotonic", side_effect=mono),
+            ):
+                mod.atomic_write_text(target, "new\n")
+            self.assertEqual(target.read_text(encoding="utf-8"), "new\n")
+            self.assertEqual(calls["n"], 3)
+            self.assertEqual(list(self.tmp.glob("status.json.*.tmp")), [])
+        finally:
+            sys.modules.pop(mod_name, None)
+
+    def test_atomic_write_persistent_windows_replace_cleans_temp(self) -> None:
+        from unittest import mock
+
+        mod_name, mod = self._load_handoff()
+        target = self.tmp / "status.json"
+        target.write_text("old\n", encoding="utf-8")
+        calls = {"n": 0}
+
+        def always_denied(src, dst):
+            calls["n"] += 1
+            raise self._windows_os_error(32, "The process cannot access the file")
+
+        clock = {"t": 0.0}
+
+        def mono() -> float:
+            return clock["t"]
+
+        def sleep(dt: float) -> None:
+            clock["t"] += dt
+
+        try:
+            with (
+                mock.patch.object(mod.os, "name", "nt"),
+                mock.patch.object(mod.os, "replace", side_effect=always_denied),
+                mock.patch.object(mod, "WINDOWS_REPLACE_RETRY_DEADLINE_S", 0.1),
+                mock.patch.object(mod, "WINDOWS_REPLACE_RETRY_DELAY_S", 0.05),
+                mock.patch.object(mod.time, "sleep", side_effect=sleep),
+                mock.patch.object(mod.time, "monotonic", side_effect=mono),
+            ):
+                with self.assertRaises(OSError) as raised:
+                    mod.atomic_write_text(target, "new\n")
+            self.assertEqual(getattr(raised.exception, "winerror", None), 32)
+            self.assertGreaterEqual(calls["n"], 2)
+            self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+            self.assertEqual(list(self.tmp.glob("status.json.*.tmp")), [])
+        finally:
+            sys.modules.pop(mod_name, None)
+
+    def test_atomic_write_non_retryable_replace_error(self) -> None:
+        from unittest import mock
+
+        mod_name, mod = self._load_handoff()
+        target = self.tmp / "status.json"
+        target.write_text("old\n", encoding="utf-8")
+        calls = {"n": 0}
+
+        def fail_once(src, dst):
+            calls["n"] += 1
+            raise self._windows_os_error(2, "The system cannot find the file specified")
+
+        try:
+            with (
+                mock.patch.object(mod.os, "name", "nt"),
+                mock.patch.object(mod.os, "replace", side_effect=fail_once),
+                mock.patch.object(mod.time, "sleep") as sleep_mock,
+            ):
+                with self.assertRaises(OSError) as raised:
+                    mod.atomic_write_text(target, "new\n")
+            self.assertEqual(getattr(raised.exception, "winerror", None), 2)
+            self.assertEqual(calls["n"], 1)
+            sleep_mock.assert_not_called()
+            self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+            self.assertEqual(list(self.tmp.glob("status.json.*.tmp")), [])
+
+            calls["n"] = 0
+
+            def posix_denied(src, dst):
+                calls["n"] += 1
+                raise self._windows_os_error(5, "Access is denied")
+
+            with (
+                mock.patch.object(mod.os, "name", "posix"),
+                mock.patch.object(mod.os, "replace", side_effect=posix_denied),
+                mock.patch.object(mod.time, "sleep") as sleep_mock2,
+            ):
+                with self.assertRaises(OSError):
+                    mod.atomic_write_text(target, "new\n")
+            self.assertEqual(calls["n"], 1)
+            sleep_mock2.assert_not_called()
+            self.assertEqual(list(self.tmp.glob("status.json.*.tmp")), [])
+        finally:
+            sys.modules.pop(mod_name, None)
+
 
 class VisibleExecutionTests(unittest.TestCase):
     def setUp(self) -> None:

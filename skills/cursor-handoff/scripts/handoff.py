@@ -45,6 +45,11 @@ REQUIRED_FLAGS = ("--print", "--output-format", "--workspace")
 OPTIONAL_FLAGS = ("--auto-review", "--trust", "--model")
 CAPABILITY_FLAGS = REQUIRED_FLAGS + OPTIONAL_FLAGS
 WINDOWS_TASKKILL_TIMEOUT = 30.0
+# ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32): brief lock while another
+# handle still has the destination open (e.g. watch console reading status.json).
+WINDOWS_REPLACE_RETRY_WINERRORS = frozenset({5, 32})
+WINDOWS_REPLACE_RETRY_DEADLINE_S = 2.0
+WINDOWS_REPLACE_RETRY_DELAY_S = 0.05
 WATCH_SCRIPT = _SCRIPTS_DIR / "watch.py"
 CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
 WINDOWS_SHELL_MARKER = "MSYSTEM"
@@ -109,6 +114,28 @@ def emit_json(data: dict, *, indent: int | None = None) -> None:
         sys.stdout.buffer.flush()
 
 
+def _is_transient_windows_replace_error(exc: BaseException) -> bool:
+    if os.name != "nt" or not isinstance(exc, OSError):
+        return False
+    return getattr(exc, "winerror", None) in WINDOWS_REPLACE_RETRY_WINERRORS
+
+
+def replace_path(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+    """Atomically replace *dst* with *src*; retry brief Windows sharing conflicts only."""
+    if os.name != "nt":
+        os.replace(src, dst)
+        return
+    deadline = time.monotonic() + WINDOWS_REPLACE_RETRY_DEADLINE_S
+    while True:
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as exc:
+            if not _is_transient_windows_replace_error(exc) or time.monotonic() >= deadline:
+                raise
+            time.sleep(WINDOWS_REPLACE_RETRY_DELAY_S)
+
+
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
@@ -117,7 +144,7 @@ def atomic_write_text(path: Path, text: str) -> None:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
+        replace_path(tmp_name, path)
     except Exception:
         try:
             os.unlink(tmp_name)
